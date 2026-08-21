@@ -1,0 +1,348 @@
+#!/usr/bin/env python3
+"""Use the built-in touchscreen as a relative touchpad under Hyprland.
+
+Reads raw evdev multitouch events from the panel and translates them into:
+  * one-finger drag   -> relative cursor motion (with acceleration)
+  * one-finger tap    -> left click   (via ydotool)
+  * two-finger tap    -> right click  (via ydotool)
+  * two-finger drag   -> vertical wheel scrolling (via ydotool)
+
+Hyprland must have the touchscreen device disabled so its absolute mapping
+does not fight this daemon (see ~/.config/hypr/input.lua).
+
+Usage: touchpad-touch [/dev/input/eventX]
+Overrides: TOUCH_DEVICE_PATH env var selects the evdev node explicitly.
+"""
+
+import json
+import math
+import os
+import fcntl
+import select
+import socket
+import subprocess
+import sys
+import time
+
+import evdev
+
+DEBUG = bool(os.environ.get("TOUCH_DEBUG"))
+
+DEVICE_NAME = "GXTP7385:00 27C6:0118"
+GAIN = 1.6              # base px-per-digitizer-unit multiplier
+ACCEL = 1.25            # extra gain as flick speed grows
+ACCEL_RAMP = 70.0       # px-per-frame at which ACCEL reaches full effect
+TAP_MS = 200             # max contact duration to count as a tap
+TAP_SLOP = 16.0          # max travel (px) during a one-finger tap
+RIGHT_TAP_SLOP = 26.0    # looser travel limit for two-finger taps
+CLICK_GAP_MS = 40        # debounce between synthesized clicks
+SCROLL_DIV = 14.0        # finger px of travel per wheel notch
+NATURAL_SCROLL = False   # True: fingers up scrolls content up
+RESYNC_SECS = 3.0        # re-scan delay when the device disappears
+# Delta rotation applied to digitizer deltas before scaling:
+#   0=(x,y) 1=(-y,-x) 2=(-x,-y) 3=(y,x) 4=(-y,x) 5=(y,-x)
+# This panel needs 4; None = derive from monitor transform.
+TOUCH_TRANSFORM = 4
+
+EV_SYN = 0x00
+EV_KEY = 0x01
+EV_ABS = 0x03
+SYN_REPORT = 0
+ABS_MT_SLOT = 0x2F
+ABS_MT_POSITION_X = 0x35
+ABS_MT_POSITION_Y = 0x36
+ABS_MT_TRACKING_ID = 0x39
+
+
+def hyprland_socket():
+    sig = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
+    if not sig:
+        return None
+    xdg = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    return os.path.join(xdg, "hypr", sig, ".socket.sock")
+
+
+IPC_PATH = hyprland_socket()
+
+
+def hyprctl_ipc(command):
+    if IPC_PATH:
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                s.connect(IPC_PATH)
+                s.sendall((command + "\n").encode())
+                s.recv(4096)
+            return
+        except OSError:
+            pass
+    args = command.split(None, 1)
+    subprocess.run(["hyprctl"] + args, timeout=2,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def move_cursor(dx, dy):
+    if DEBUG:
+        print(f"move {dx},{dy}", flush=True)
+    hyprctl_ipc(
+        f"eval local p = hl.get_cursor_pos() "
+        f"hl.dispatch(hl.dsp.cursor.move({{ x = p.x + {dx}, y = p.y + {dy} }}))")
+
+
+def monitor_info():
+    """(logical width, logical height, transform) for eDP-1 or the first output."""
+    try:
+        out = subprocess.run(["hyprctl", "monitors", "-j"], capture_output=True,
+                             text=True, timeout=2).stdout
+        monitors = json.loads(out)
+        mon = next((m for m in monitors if m.get("name") == "eDP-1"), monitors[0])
+        scale = mon.get("scale", 1)
+        return (mon["width"] / scale, mon["height"] / scale, mon.get("transform", 0))
+    except Exception:
+        return (None, None, 0)
+
+
+def logical_scale(max_x, max_y):
+    """(sx, sy, delta_transform) mapping digitizer units to logical pixels."""
+    w, h, tf = monitor_info()
+    if w is None:
+        return GAIN, GAIN, 0
+    rot = tf if tf in (1, 2, 3) else 0
+    digitizer_ar = max_x / max_y
+    output_ar = w / h
+    if abs(digitizer_ar - output_ar) / output_ar < 0.05:
+        # digitizer ranges share the output's orientation
+        return w / max_x * GAIN, h / max_y * GAIN, rot
+    if abs(1 / digitizer_ar - output_ar) / output_ar < 0.05:
+        # digitizer is rotated relative to the output: swap scale axes too
+        return w / max_y * GAIN, h / max_x * GAIN, rot
+    return w / max_x * GAIN, h / max_y * GAIN, rot
+
+
+def ydotool(args):
+    try:
+        subprocess.run(["ydotool"] + args, timeout=2,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError as exc:
+        print(f"touchpad-touch: ydotool failed: {exc}", file=sys.stderr)
+
+
+def accelerate(delta):
+    mag = abs(delta)
+    if mag < 1e-6:
+        return 0.0
+    boost = 1.0 + ACCEL * min(mag / ACCEL_RAMP, 1.0)
+    return math.copysign(mag * boost, delta)
+
+
+class Touchpad:
+    def __init__(self, sx, sy, transform=0):
+        self.sx, self.sy = sx, sy
+        self.transform = transform
+        self.slots = {}
+        self.cur_slot = 0
+        self.last_pos = None
+        self.scroll_ref = None
+        self.scroll_acc = 0.0
+        self.multi_seen = False
+        self.consumed = set()
+        self.last_click = 0.0
+        self.rem_x = 0.0
+        self.rem_y = 0.0
+
+    def feed(self, ev):
+        if ev.type == EV_ABS:
+            if ev.code == ABS_MT_SLOT:
+                self.cur_slot = ev.value
+            elif ev.code == ABS_MT_TRACKING_ID:
+                slot = self.slots.setdefault(
+                    self.cur_slot,
+                    {"tid": None, "x": None, "y": None, "moved": 0.0, "t0": 0.0})
+                if ev.value == -1:
+                    self.lift(slot)
+                    slot["tid"] = None
+                else:
+                    slot["tid"] = ev.value
+                    slot["t0"] = time.monotonic() * 1000.0
+                    slot["moved"] = 0.0
+                    slot["x"] = None
+                    slot["y"] = None
+                self.slots[self.cur_slot] = slot
+            elif ev.code == ABS_MT_POSITION_X:
+                self.track("x", ev.value)
+            elif ev.code == ABS_MT_POSITION_Y:
+                self.track("y", ev.value)
+        elif ev.type == EV_SYN and ev.code == SYN_REPORT:
+            self.frame()
+
+    def track(self, axis, value):
+        slot = self.slots.setdefault(
+            self.cur_slot,
+            {"tid": None, "x": None, "y": None, "moved": 0.0, "t0": 0.0})
+        old = slot[axis]
+        if old is None:
+            slot[axis] = float(value)
+            return
+        if slot["tid"] is not None:
+            scale = self.sx if axis == "x" else self.sy
+            slot["moved"] += abs(value - old) * scale
+        slot[axis] = float(value)
+
+    def lift(self, slot):
+        tid = slot.get("tid")
+        if tid is None:
+            return
+        now = time.monotonic() * 1000.0
+        dur = now - slot.get("t0", now)
+        remaining = [s for s in self.slots.values()
+                     if s["tid"] is not None and s is not slot]
+        if len(remaining) == 1 and self.qualifies(remaining[0], RIGHT_TAP_SLOP, TAP_MS):
+            self.consumed.add(remaining[0]["tid"])
+            self.click("0xC1")
+        elif (not self.multi_seen and not remaining and dur <= TAP_MS
+              and slot["moved"] <= TAP_SLOP and now - self.last_click >= CLICK_GAP_MS):
+            self.click("0xC0")
+
+    @staticmethod
+    def qualifies(slot, slop, max_ms):
+        if slot["tid"] is None:
+            return False
+        now = time.monotonic() * 1000.0
+        return (now - slot["t0"] <= max_ms and slot["moved"] <= slop)
+
+    def click(self, button):
+        if DEBUG:
+            print(f"click {button}", flush=True)
+        self.last_click = time.monotonic() * 1000.0
+        ydotool(["click", button])
+
+    def rotate(self, dx, dy):
+        if self.transform == 1:
+            return -dy, -dx
+        if self.transform == 2:
+            return -dx, -dy
+        if self.transform == 3:
+            return dy, dx
+        if self.transform == 4:
+            return -dy, dx
+        if self.transform == 5:
+            return dy, -dx
+        return dx, dy
+
+    def frame(self):
+        active = [s for s in self.slots.values()
+                  if s["tid"] is not None and s["x"] is not None and s["y"] is not None]
+        n = len(active)
+        if n == 1:
+            s = active[0]
+            if self.last_pos is not None:
+                self.move(s["x"] - self.last_pos[0], s["y"] - self.last_pos[1])
+            self.last_pos = (s["x"], s["y"])
+            self.scroll_ref = None
+        elif n >= 2:
+            if not self.multi_seen and DEBUG:
+                print("scroll-mode enter", flush=True)
+            self.multi_seen = True
+            self.last_pos = None
+            mean = (sum(s["x"] for s in active[:2]) / min(n, 2),
+                    sum(s["y"] for s in active[:2]) / min(n, 2))
+            if self.scroll_ref is not None:
+                _, rdy = self.rotate(mean[0] - self.scroll_ref[0],
+                                     mean[1] - self.scroll_ref[1])
+                self.scroll_acc += rdy
+            self.scroll_ref = mean
+            while abs(self.scroll_acc) >= SCROLL_DIV:
+                step = SCROLL_DIV if self.scroll_acc > 0 else -SCROLL_DIV
+                self.scroll_acc -= step
+                rel = -step / SCROLL_DIV if not NATURAL_SCROLL else step / SCROLL_DIV
+                if DEBUG:
+                    print(f"wheel {int(rel)}", flush=True)
+                ydotool(["mousemove", "-w", "-x", "0", "-y", str(int(rel))])
+        else:
+            self.last_pos = None
+            self.scroll_ref = None
+            self.multi_seen = False
+            self.scroll_acc = 0.0
+            self.consumed.clear()
+
+    def move(self, dx_units, dy_units):
+        rdx, rdy = self.rotate(dx_units, dy_units)
+        self.rem_x += accelerate(rdx * self.sx)
+        self.rem_y += accelerate(rdy * self.sy)
+        ix, iy = int(round(self.rem_x)), int(round(self.rem_y))
+        self.rem_x -= ix
+        self.rem_y -= iy
+        if ix or iy:
+            move_cursor(ix, iy)
+
+
+def find_device(path=None):
+    if path:
+        return evdev.InputDevice(path)
+    for p in evdev.list_devices():
+        try:
+            dev = evdev.InputDevice(p)
+        except OSError:
+            continue
+        if dev.name == DEVICE_NAME:
+            return dev
+        dev.close()
+    return None
+
+
+def serve(dev):
+    caps = dev.capabilities(absinfo=False).get(EV_ABS, [])
+    missing = {ABS_MT_POSITION_X, ABS_MT_POSITION_Y} - set(caps)
+    if missing:
+        raise RuntimeError(f"device lacks multitouch axes: {missing}")
+    max_x = dev.absinfo(ABS_MT_POSITION_X).max
+    max_y = dev.absinfo(ABS_MT_POSITION_Y).max
+    sx, sy, tf = logical_scale(max_x, max_y)
+    if TOUCH_TRANSFORM is not None:
+        tf = TOUCH_TRANSFORM
+    if os.environ.get("TOUCH_TRANSFORM") is not None:
+        tf = int(os.environ["TOUCH_TRANSFORM"])
+    tp = Touchpad(sx, sy, tf)
+    print(f"touchpad-touch: serving {dev.path} ({dev.name}) "
+          f"range={max_x}x{max_y} scale=({sx:.3f},{sy:.3f}) transform={tf}", flush=True)
+    while True:
+        r, _, _ = select.select([dev.fd], [], [], 1.0)
+        if not r:
+            continue
+        for ev in dev.read():
+            tp.feed(ev)
+
+
+def main():
+    lock = open("/tmp/opencode/touchpad-touch.lock", "w") \
+        if os.environ.get("TOUCH_DEBUG") else \
+        open(os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"),
+                          "touchpad-touch.lock"), "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("touchpad-touch: another instance is running, exiting", flush=True)
+        return
+    path = os.environ.get("TOUCH_DEVICE_PATH") or (
+        sys.argv[1] if len(sys.argv) > 1 else None)
+    while True:
+        try:
+            dev = find_device(path)
+            if dev is None:
+                time.sleep(RESYNC_SECS)
+                continue
+            try:
+                serve(dev)
+            finally:
+                dev.close()
+        except (OSError, RuntimeError, BlockingIOError) as exc:
+            print(f"touchpad-touch: {exc}", file=sys.stderr)
+        if path:
+            raise SystemExit(1)
+        time.sleep(RESYNC_SECS)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass
