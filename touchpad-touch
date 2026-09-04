@@ -28,7 +28,7 @@ import evdev
 
 DEBUG = bool(os.environ.get("TOUCH_DEBUG"))
 
-DEVICE_NAME = "GXTP7385:00 27C6:0118"
+DEVICE_NAME = "Goodix Capacitive TouchScreen"
 GAIN = 1.6              # base px-per-digitizer-unit multiplier
 ACCEL = 1.25            # extra gain as flick speed grows
 ACCEL_RAMP = 70.0       # px-per-frame at which ACCEL reaches full effect
@@ -41,8 +41,9 @@ NATURAL_SCROLL = False   # True: fingers up scrolls content up
 RESYNC_SECS = 3.0        # re-scan delay when the device disappears
 # Delta rotation applied to digitizer deltas before scaling:
 #   0=(x,y) 1=(-y,-x) 2=(-x,-y) 3=(y,x) 4=(-y,x) 5=(y,-x)
-# This panel needs 4; None = derive from monitor transform.
-TOUCH_TRANSFORM = 4
+# This panel needs 5; None = derive from monitor transform.
+# Empirical (AyaNeo 2S, transform=3): right-drag→digitizer(-X,+Y), up→(+X,~0).
+TOUCH_TRANSFORM = 5
 
 EV_SYN = 0x00
 EV_KEY = 0x01

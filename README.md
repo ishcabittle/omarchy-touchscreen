@@ -19,7 +19,7 @@ absolute pen.
 | Piece | Location | Purpose |
 |---|---|---|
 | Daemon | `~/.local/bin/touchpad-touch` | Reads raw evdev events from the panel, drives cursor/clicks/scroll. Snapshot in this repo: [`touchpad-touch`](touchpad-touch) |
-| Device disable | `~/.config/hypr/input.lua` | `hl.device({ name = "gxtp7385:00-27c6:0118", enabled = false })` — stops Hyprland's absolute touch handling |
+| Device disable | `~/.config/hypr/input.lua` | `hl.device({ name = "goodix-capacitive-touchscreen-1", enabled = false })` — stops Hyprland's absolute touch handling |
 | Autostart | `~/.config/hypr/autostart.lua` | `o.exec_on_start(os.getenv("HOME") .. "/.local/bin/touchpad-touch")` |
 | Synthetic input | `ydotool` package + `ydotool.service` (systemd **user** unit shipped by the package) | Clicks and wheel events (`ydotoold` talks to `/dev/uinput`) |
 | Python evdev | `python-evdev` package | Raw event reading |
@@ -27,35 +27,36 @@ absolute pen.
 Package versions this was built against: `ydotool 1.0.4-2`, `python-evdev 1.9.3-1`.
 User must be in the `input` group (already true on Omarchy).
 
-## Hardware facts (this machine)
+## Hardware facts (this machine — AyaNeo 2S)
 
-* Touch controller: Goodix `GXTP7385:00 27C6:0118`, i2c device, exposes **four**
-  evdev nodes. Only the main node carries finger data; the others never emit
-  during finger touches:
+* Touch controller: Goodix `GDIX1002:00`, i2c on `AMDI0010:00`, VID:PID
+  **0416:038F**, evdev name `Goodix Capacitive TouchScreen`. One single node
+  (there is no stylus/secondary split on this unit, unlike the old GXTP panel):
 
   | Node | Name suffix | Notes |
   |---|---|---|
-  | `event19` (numbering can change!) | *(none)* | The multitouch finger node — the only one the daemon reads |
-  | `event20` | ` Stylus` | Pen input; left enabled so the pen still works |
-  | `event21` | ` UNKNOWN` | Silent for fingers |
-  | `event22` | ` Keyboard` | Silent for fingers |
+  | `event15` (numbering can change!) | *(none)* | The only touch node; what the daemon reads |
 
-* Main node protocol quirk: it does **not** use `ABS_MT_SLOT`. It emits
-  `ABS_MT_TRACKING_ID` (sequential ids, `-1` on lift) +
-  `ABS_MT_POSITION_X/Y`, plus legacy duplicate `ABS_X/ABS_Y` and `BTN_TOUCH`,
-  all strictly one contact at a time.
-* Digitizer range: `3600 x 5760` (portrait aspect).
-* Panel: eDP-1, mode `1200x1920@60`, `scale = 2`, `transform = 1`
+* Main node protocol: no `ABS_MT_SLOT` frames are emitted for single-finger
+  contact (the driver defaults to slot 0). It sends `ABS_MT_TRACKING_ID`
+  (sequential ids, `-1` on lift) + `ABS_MT_POSITION_X/Y` + `ABS_MT_TOUCH_MAJOR`,
+  plus legacy duplicates `ABS_X/ABS_Y` and `BTN_TOUCH`.
+* Digitizer range: `800 x 1280` (same aspect as the panel, so scale is uniform).
+* Panel: eDP-1, mode `1200x1920@60`, `scale = 2`, `transform = 3`
   (see `~/.config/hypr/monitors.lua`) → logical footprint `600x960`.
+* Hyprland quirk: because the device has key bits, it is listed **twice** in
+  `hyprctl devices` — as a keyboard `goodix-capacitive-touchscreen` and as a
+  touch device `goodix-capacitive-touchscreen-1`. The `hl.device` disable rule
+  must use the **touch-section** name (with the `-1`).
 
-### Axis mapping (why `TOUCH_TRANSFORM = 4`)
+### Axis mapping (why `TOUCH_TRANSFORM = 5`)
 
-Empirically calibrated on this unit:
+Empirically calibrated on this unit (drag strokes while logging raw deltas):
 
-* Finger moving physically **right** produces digitizer **−Y** motion.
-* Finger moving physically **up** produces digitizer **−X** motion.
+* Finger moving physically **right** produces digitizer `(−X, +Y)` motion.
+* Finger moving physically **up** produces digitizer `(+X, ~0)` motion.
 
-So screen deltas are `(−dy, +dx)` — transform code `4` in the script:
+So screen deltas are `(dy, −dx)` — transform code `5` in the script:
 
 | code | delta map |
 |---|---|
@@ -63,14 +64,14 @@ So screen deltas are `(−dy, +dx)` — transform code `4` in the script:
 | 1 | `(−y, −x)` |
 | 2 | `(−x, −y)` |
 | 3 | `(y, x)` |
-| **4** | **`(−y, x)` ← this panel** |
-| 5 | `(y, −x)` |
+| **5** | **`(y, −x)` ← this panel** |
+| 4 | `(−y, x)` |
 
 If monitor geometry ever changes (different rotation in `monitors.lua`),
 re-check directions and adjust `TOUCH_TRANSFORM` in the script (or override at
 runtime with the `TOUCH_TRANSFORM` env var).
 
-Scale comes out uniform: `600 px / 3600 units × GAIN(1.6) ≈ 0.267 px/unit`.
+Scale comes out uniform: `600 px / 800 units × GAIN(1.6) = 1.2 px/unit`.
 
 ## Hyprland build quirks (important!)
 
@@ -121,11 +122,13 @@ Manual steps, for reference:
 3. In `~/.config/hypr/input.lua` add:
    ```lua
    hl.device({
-     name = "gxtp7385:00-27c6:0118",
+     name = "goodix-capacitive-touchscreen-1",
      enabled = false,
    })
    ```
-   (Use the lowercased name exactly as `hyprctl devices` shows it.)
+   (Use the name from the **touch** section exactly as `hyprctl devices` shows
+   it. `install.sh` replaces the stale device name if you already have an
+   `hl.device` block from a previous device.)
 4. In `~/.config/hypr/autostart.lua` add:
    ```lua
    o.exec_on_start(os.getenv("HOME") .. "/.local/bin/touchpad-touch")

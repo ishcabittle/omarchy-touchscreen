@@ -7,7 +7,8 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DAEMON="$HOME/.local/bin/touchpad-touch"
 INPUT_LUA="$HOME/.config/hypr/input.lua"
 AUTOSTART_LUA="$HOME/.config/hypr/autostart.lua"
-DEVICE_NAME="gxtp7385:00-27c6:0118"   # as shown by `hyprctl devices`
+DEVICE_NAME="goodix-capacitive-touchscreen-1"   # as shown by `hyprctl devices` (touch section)
+STALE_NAMES="gxtp7385:00-27c6:0118\|goodix-capacitive-touchscreen"
 
 log() { printf '\033[32m==>\033[0m %s\n' "$*"; }
 
@@ -26,7 +27,13 @@ systemctl --user enable --now ydotool.service
 log "Installing daemon to $DAEMON"
 install -Dm755 "$REPO_DIR/touchpad-touch" "$DAEMON"
 
-if ! grep -q "hl.device" "$INPUT_LUA" 2>/dev/null; then
+if grep -q "name = \"$DEVICE_NAME\"" "$INPUT_LUA" 2>/dev/null; then
+  log "input.lua already disables $DEVICE_NAME"
+elif grep -q "$STALE_NAMES" "$INPUT_LUA" 2>/dev/null; then
+  log "Replacing stale touchscreen device name in $INPUT_LUA"
+  sed -i 's/name = "gxtp7385:00-27c6:0118"/name = "goodix-capacitive-touchscreen-1"/;
+          s/name = "goodix-capacitive-touchscreen"/name = "goodix-capacitive-touchscreen-1"/' "$INPUT_LUA"
+else
   log "Adding device disable to $INPUT_LUA"
   cat >> "$INPUT_LUA" <<EOF
 
@@ -37,8 +44,6 @@ hl.device({
   enabled = false,
 })
 EOF
-else
-  log "input.lua already has an hl.device block, skipping"
 fi
 
 if ! grep -q "touchpad-touch" "$AUTOSTART_LUA" 2>/dev/null; then
